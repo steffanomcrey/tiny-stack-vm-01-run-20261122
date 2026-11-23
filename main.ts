@@ -1,181 +1,45 @@
-// Tiny Stack VM, ISA v1 (make.fun, 22 Nov 2026). Faithful interpreter:
-// one run answers a whole set, reading program.bin/input.bin per instance
-// and writing stdout.bin and exit.txt. Node 22, stdlib only.
-
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-
-// Limits (ISA.md): 256 stack, 64 call depth, 256 words, 1M steps, 64K out.
-const STACK_MAX = 256;
-const CALLS_MAX = 64;
-const MEMORY_WORDS = 256;
-const STEP_LIMIT = 1_000_000;
-const OUTPUT_MAX = 65_536;
-
-// Trap codes (ISA.md). A trap ends the program at once, keeps prior
-// output, and is the exit code.
-const TRAP = {
-  UNDERFLOW: 2, OVERFLOW: 3, DIV_ZERO: 4, BAD_OPCODE: 5, MEMORY: 6,
-  CALL_DEPTH: 7, RET_EMPTY: 8, PC: 9, STEPS: 10, OUTPUT: 11,
-};
-
-function trap(code: number): never {
-  throw code;
+import{readdirSync,readFileSync,writeFileSync,mkdirSync}from'node:fs';
+const T=c=>{throw c};
+function R(d){
+let p=readFileSync(I+'/'+d+'/program.bin'),q=readFileSync(I+'/'+d+'/input.bin'),s=new Int32Array(256),m=new Int32Array(256),c=[],o=[],sp=0,ip=0,pc=0,t=0,x=0,a,b;
+const N=n=>sp<n&&T(2),P=v=>{sp>255&&T(3);s[sp++]=v};
+try{for(;;){
+t>=1e6&&T(10);
+(pc>>>0)>=p.length&&T(9);
+let k=p[pc],L=k==2?4:k==1?1:k>47&&k<52?2:0;
+pc+L>=p.length&&T(9);
+t++;
+if(k==0)T(0);
+else if(k==1)P(p[pc+1]<<24>>24);
+else if(k==2)P(p[pc+1]|p[pc+2]<<8|p[pc+3]<<16|p[pc+4]<<24);
+else if(k==3)N(1),sp--;
+else if(k==4)N(1),P(s[sp-1]);
+else if(k==5)N(2),a=s[sp-1],s[sp-1]=s[sp-2],s[sp-2]=a;
+else if(k==6)N(2),P(s[sp-2]);
+else if(k==7)N(3),a=s[sp-3],s[sp-3]=s[sp-2],s[sp-2]=s[sp-1],s[sp-1]=a;
+else if(k>15&&k<35&&k!=31){
+if(k==23||k==27)N(1),s[sp-1]=k<24?-s[sp-1]:~s[sp-1];
+else N(2),b=s[--sp],a=s[sp-1],s[sp-1]=k==16?a+b:k==17?a-b:k==18?Math.imul(a,b):k==19?b?(a/b)|0:T(4):k==20?b?a%b:T(4):k==21?b?((a>>>0)/(b>>>0))|0:T(4):k==22?b?((a>>>0)%(b>>>0))|0:T(4):k==24?a&b:k==25?a|b:k==26?a^b:k==28?a<<(b&31):k==29?a>>(b&31):k==30?a>>>(b&31):k==32?a==b?1:0:k==33?a<b?1:0:(a>>>0)<(b>>>0)?1:0;
 }
-
-// Opcode metadata (reference VM's OPS table): [imm bytes, popped,
-// pushed] per opcode; the loop checks ISA.md's rules with it first.
-const OP_INFO = {
-  0x00: [0,0,0], 0x01: [1,0,1], 0x02: [4,0,1], 0x03: [0,1,0],
-  0x04: [0,1,2], 0x05: [0,2,2], 0x06: [0,2,3], 0x07: [0,3,3],
-  0x10: [0,2,1], 0x11: [0,2,1], 0x12: [0,2,1], 0x13: [0,2,1],
-  0x14: [0,2,1], 0x15: [0,2,1], 0x16: [0,2,1], 0x17: [0,1,1],
-  0x18: [0,2,1], 0x19: [0,2,1], 0x1a: [0,2,1], 0x1b: [0,1,1],
-  0x1c: [0,2,1], 0x1d: [0,2,1], 0x1e: [0,2,1], 0x20: [0,2,1],
-  0x21: [0,2,1], 0x22: [0,2,1], 0x30: [2,0,0], 0x31: [2,1,0],
-  0x32: [2,1,0], 0x33: [2,0,0], 0x34: [0,0,0], 0x40: [0,1,1],
-  0x41: [0,2,0], 0x50: [0,1,0], 0x51: [0,1,0], 0x52: [0,0,1],
-  0x53: [0,1,0],
-};
-
-// Binary ops (a, b), b on top, one result. Arithmetic wraps mod 2^32;
-// DIV truncates toward zero, MOD keeps a's sign, DIVU/MODU/LTU unsigned.
-const BIN = {
-  0x10: (a,b)=>(a+b)|0,
-  0x11: (a,b)=>(a-b)|0,
-  0x12: (a,b)=>Math.imul(a,b),
-  0x13: (a,b)=>b===0 ? trap(TRAP.DIV_ZERO) : a===-2147483648 && b===-1 ? a : (a/b)|0,
-  0x14: (a,b)=>b===0 ? trap(TRAP.DIV_ZERO) : b===-1 ? 0 : (a%b)|0,
-  0x15: (a,b)=>b===0 ? trap(TRAP.DIV_ZERO) : Math.floor((a>>>0)/(b>>>0))|0,
-  0x16: (a,b)=>b===0 ? trap(TRAP.DIV_ZERO) : (a>>>0)%(b>>>0)|0,
-  0x18: (a,b)=>a&b,
-  0x19: (a,b)=>a|b,
-  0x1a: (a,b)=>a^b,
-  0x1c: (a,b)=>a<<(b&31),
-  0x1d: (a,b)=>a>>(b&31),
-  0x1e: (a,b)=>(a>>>(b&31))|0,
-  0x20: (a,b)=>a===b ? 1 : 0,
-  0x21: (a,b)=>a<b ? 1 : 0,
-  0x22: (a,b)=>a>>>0 < (b>>>0) ? 1 : 0,
-};
-
-// Run one program, returning what the reference VM produces.
-function runProgram(program: Buffer, input: Buffer) {
-  const data = new Int32Array(STACK_MAX);
-  let sp = 0;
-  const calls = new Int32Array(CALLS_MAX);
-  let csp = 0;
-  const memory = new Int32Array(MEMORY_WORDS);
-  const output = new Uint8Array(OUTPUT_MAX);
-  let outLen = 0;
-  let inPos = 0;
-  let pc = 0;
-  let steps = 0;
-
-  const finish = (exit: number) => ({ stdout: output.subarray(0, outLen), exit });
-
-  try {
-    for (;;) {
-      // ISA.md "One step", in order: limit, pc, opcode, immediate fit.
-      if (steps === STEP_LIMIT) trap(TRAP.STEPS);
-      if (pc < 0 || pc >= program.length) trap(TRAP.PC);
-      const opcode = program[pc];
-      const info = OP_INFO[opcode];
-      if (info === undefined) trap(TRAP.BAD_OPCODE);
-      const [imm, pops, pushes] = info;
-      if (pc + imm >= program.length) trap(TRAP.PC);
-      steps += 1;
-      const next = pc + 1 + imm;
-      // Stack needs are checked before the instruction's own traps.
-      if (sp < pops) trap(TRAP.UNDERFLOW);
-      if (sp - pops + pushes > STACK_MAX) trap(TRAP.OVERFLOW);
-      pc = next;
-
-      const bin = BIN[opcode];
-      if (bin !== undefined) {
-        const b = data[sp - 1];
-        const a = data[sp - 2];
-        sp -= 2;
-        data[sp++] = bin(a, b);
-        continue;
-      }
-
-      switch (opcode) {
-        case 0x00: return finish(0); // HALT
-        case 0x01: data[sp++] = (program[next - 1] << 24) >> 24; break; // PUSH8, sign-extended
-        case 0x02: // PUSH32, signed 32-bit little-endian
-          data[sp++] = program[next - 4] | (program[next - 3] << 8) |
-            (program[next - 2] << 16) | (program[next - 1] << 24);
-          break;
-        case 0x03: sp -= 1; break; // POP
-        case 0x04: data[sp] = data[sp - 1]; sp += 1; break; // DUP: spelled out (data[sp++] reads above the top)
-        case 0x05: { const t = data[sp - 1]; data[sp - 1] = data[sp - 2]; data[sp - 2] = t; break; } // SWAP
-        case 0x06: data[sp] = data[sp - 2]; sp += 1; break; // OVER: same reason as DUP
-        case 0x07: { const a = data[sp - 3]; data[sp - 3] = data[sp - 2]; data[sp - 2] = data[sp - 1]; data[sp - 1] = a; break; } // ROT (a b c -- b c a)
-        case 0x17: data[sp - 1] = (-data[sp - 1]) | 0; break; // NEG, wraps
-        case 0x1b: data[sp - 1] = ~data[sp - 1]; break; // NOT
-        case 0x30: pc = next + (((program[next - 2] | (program[next - 1] << 8)) << 16) >> 16); break; // JMP
-        case 0x31: case 0x32: { // JZ / JNZ
-          const v = data[--sp];
-          if ((opcode === 0x31) === (v === 0)) pc = next + (((program[next - 2] | (program[next - 1] << 8)) << 16) >> 16);
-          break;
-        }
-        case 0x33: // CALL
-          if (csp === CALLS_MAX) trap(TRAP.CALL_DEPTH);
-          calls[csp++] = next;
-          pc = program[next - 2] | (program[next - 1] << 8);
-          break;
-        case 0x34: // RET
-          if (csp === 0) trap(TRAP.RET_EMPTY);
-          pc = calls[--csp];
-          break;
-        case 0x40: { // LOAD
-          const addr = data[sp - 1];
-          if (addr < 0 || addr >= MEMORY_WORDS) trap(TRAP.MEMORY);
-          data[sp - 1] = memory[addr];
-          break;
-        }
-        case 0x41: { // STORE ( v addr -- )
-          const addr = data[sp - 1];
-          const value = data[sp - 2];
-          if (addr < 0 || addr >= MEMORY_WORDS) trap(TRAP.MEMORY);
-          sp -= 2;
-          memory[addr] = value;
-          break;
-        }
-        case 0x50: { // PRINT, decimal ASCII. A write past the limit traps 11,
-          // writing none of its bytes.
-          const text = String(data[sp - 1]);
-          if (outLen + text.length > OUTPUT_MAX) trap(TRAP.OUTPUT);
-          sp -= 1;
-          output.set(Buffer.from(text, 'ascii'), outLen);
-          outLen += text.length;
-          break;
-        }
-        case 0x51: // PUTC, one byte v AND 255
-          if (outLen + 1 > OUTPUT_MAX) trap(TRAP.OUTPUT);
-          output[outLen++] = data[--sp] & 255;
-          break;
-        case 0x52: data[sp++] = inPos < input.length ? input[inPos++] : -1; break; // IN, -1 past the end
-        case 0x53: return finish(data[sp - 1] & 255); // EXIT
-        default: trap(TRAP.BAD_OPCODE); // unreachable: checked above
-      }
-    }
-  } catch (e) {
-    // A trap: its code is the exit code, prior output is kept.
-    return finish(e as number);
-  }
+else if(k>47&&k<52){
+let j=(p[pc+1]|p[pc+2]<<8)<<16>>16;
+if(k==48){pc+=3+j;continue}
+if(k==49){N(1);a=s[--sp];pc+=3+(a?0:j);continue}
+if(k==50){N(1);a=s[--sp];pc+=3+(a?j:0);continue}
+c.length>63&&T(7);c.push(pc+3);pc=p[pc+1]|p[pc+2]<<8;continue;
 }
-
-// Answer every instance in id order (env dirs locally, /input and /output on the grader).
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-
-for (const id of readdirSync(inputDir).sort()) {
-  const { stdout, exit } = runProgram(
-    readFileSync(join(inputDir, id, 'program.bin')),
-    readFileSync(join(inputDir, id, 'input.bin')));
-  mkdirSync(join(outputDir, id), { recursive: true });
-  writeFileSync(join(outputDir, id, 'stdout.bin'), stdout);
-  writeFileSync(join(outputDir, id, 'exit.txt'), `${exit}\n`);
+else if(k==52){!c.length&&T(8);pc=c.pop();continue}
+else if(k==64)N(1),a=s[sp-1],(a>>>0)>255&&T(6),s[sp-1]=m[a];
+else if(k==65)N(2),a=s[--sp],b=s[--sp],(a>>>0)>255&&T(6),m[a]=b;
+else if(k==80){N(1);a=s[--sp];let g=''+a;o.length+g.length>65536&&T(11);o.push(...Buffer.from(g))}
+else if(k==81)N(1),o.length>65535&&T(11),o.push(s[--sp]&255);
+else if(k==82)P(ip<q.length?q[ip++]:-1);
+else if(k==83)N(1),T(s[--sp]&255);
+else T(5);
+pc+=1+L;
+}}catch(e){x=e}
+writeFileSync(O+'/'+d+'/stdout.bin',Buffer.from(o));
+writeFileSync(O+'/'+d+'/exit.txt',x+'\n');
 }
+const I=process.env.MAKEFUN_INPUT_DIR||'/input',O=process.env.MAKEFUN_OUTPUT_DIR||'/output';
+for(const d of readdirSync(I).sort()){mkdirSync(O+'/'+d,{recursive:true});R(d)}
